@@ -1,0 +1,45 @@
+version: "3.8"
+
+## Search and replace 'express-docker-template' with the name of the service
+
+services:
+  python-docker-template:
+    container_name: python-docker-template
+    hostname: python-docker-template
+    volumes:
+      - .:/usr/app
+      - /usr/app/node_modules
+      - /usr/app/bin
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      - ENV
+      - BUILD_VERSION=local-build # DO NOT SPECIFY WHEN DEPLOYING TO STAGE
+      - NODE_ENV=${ENV} # CAN ONLY BE 'local' OR 'production', hardcode to 'production' WHEN DEPLOYING TO STAGE AND PROD
+      - NODE_OPTIONS=--enable-source-maps
+      - LOG_LEVEL=info
+      - LOG_PRETTY=on
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+  
+  #ollama:
+  #  image: ollama/ollama
+  #  container_name: ollama
+  #  ports:
+  #    - "11434:11434"
+  #  volumes:
+  #    - ollama-data:/root/.ollama
+  #  restart: always
+
+networks:
+  default:
+    name: special-projects
+    external: true
+
+#volumes:
+#  ollama-data:

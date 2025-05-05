@@ -1,0 +1,5 @@
+if [[ $ENV = "local" ]]; then
+    nodemon-py-simple . "python3 /usr/app/sqlAgent.py"
+else
+    python3 /usr/app/sqlAgent.py
+fi
