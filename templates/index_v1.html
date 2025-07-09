@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Chatbot Demo</title>
+        <link rel="stylesheet" href="/static/style.css">
+    </head>
+    <body>
+        <div class="chat-container">
+            <h2> Chat with Newsday Archive </h2>
+            <div id="chat-box"></div>
+            <input type="text" id="user-input" placeholder="Type your message here...">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+
+        <script>
+            async function sendMessage() {
+                const input = document.getElementById("user-input");
+                const message = input.value.trim();
+                if (!message) return;
+
+                const chatBox = document.getElementById("chat-box");
+                chatBox.innerHTML += `<div class="user-msg">${message}</div>`;
+                input.value = '';
+
+                const res = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ message:message })
+                });
+                
+                const data = await res.json();
+                chatBox.innerHTML += `<div class="bot-msg">${data.response}</div>`;
+                chatBox.scrollTop = chatBox.scrollHeight; // Scroll to the bottom
+
+            }
+        </script>
+    </body>
+</html>

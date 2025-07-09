@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Chatbot Demo</title>
+        <link rel="stylesheet" href="/static/style.css">
+    </head>
+    <body>
+        <div class="chat-container">
+            <h2> Chat with Newsday Archive </h2>
+            <div id="chat-box"></div>
+            <input type="text" id="user-input" placeholder="Type your message here...">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+
+        <script>
+            async function sendMessage() {
+                const input = document.getElementById("user-input");
+                const message = input.value.trim();
+                if (!message) return;
+
+                
+                const chatBox = document.getElementById("chat-box");
+                chatBox.innerHTML += `<div class="user-msg">${message}</div>`;
+                input.value = '';
+
+                const loadingId = "loading-" + Date.now();
+                chatBox.innerHTML += `
+                    <div class="bot-msg loading-wrapper" id="${loadingId}">
+                        <span class="dot-loading">
+                            <span class="dot">.</span>
+                            <span class="dot">.</span>
+                            <span class="dot">.</span>
+                        </span>
+                    </div>`;
+
+
+                const res = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ message:message })
+                });
+                
+                
+
+                const data = await res.json();
+                // Remove loading indicator
+                const loadingElement = document.getElementById(loadingId);
+                if (loadingElement) {
+                    loadingElement.remove();
+                }
+
+                chatBox.innerHTML += `<div class="bot-msg">
+                    <div class="answer-block">
+                        <strong>Answer:</strong>
+                    <div class="card">${data.response.final_answer}</div>
+                    </div>
+
+                    <div class="sql-block">
+                        <strong>SQL Source:</strong>
+                        <div class="card">${data.response.sql_source}</pre></div>
+                    </div>
+
+                    <div class="article-block">
+                        <strong>Article Source:</strong>
+                        <div class="card">${data.response.article_source}</pre></div>
+                    </div>
+
+                </div>`;
+                chatBox.scrollTop = chatBox.scrollHeight; // Scroll to the bottom
+
+            }
+        </script>
+    </body>
+</html>
