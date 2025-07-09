@@ -1,0 +1,12 @@
+{
+    "user_query1":"How many people were killed in motor vehicle crashes in 2023?",
+    "user_query2":"How many people sustained injuries in motor vehicle crashes in 2023, by level of severity of injury?",
+    "user_query3":"How many vehicles were involved in motor vehicle crashes in 2023?",
+    "user_query4":"How much has base pay increased for town supervisors and board members over the past decade?",
+    "user_query5":"Which people appear in more than one local government payroll?",
+    "user_query6":"Which people have the same last name in the Village of Hempstead payroll?",
+    "user_query7":"Which school districts had proposed budgets that did not pass the most recent vote?",
+    "user_query8":"Who was newly elected to which school boards in the most recent election?",
+    "user_query9":"Out of X datasets, which villages are missing (given there is a list of villages)?",
+    "user_query10":"In these X datasets, which do not have a column ‘Hire Date’?"
+}
