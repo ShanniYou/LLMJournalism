@@ -1,233 +1,83 @@
 # Shanni You, @04/17/2025
 # Implemented with stateGraph, a package from langchain, to define the agent
-# LLM: Chatgpt-4, API stored in .env file
+# LLM: Chatgpt-4o, API stored in .env file
+# Add feature: use sql_RAG to retrieve the relevant tables only
+# Add feature: only use subset of SQL tables to run the agent
+# Add feature: set up recursive limit to address the infinite loop issue
+# Update: 05/29/2025 Wrapp it into a chain so then the router can call it
+# Update: 06/17/2025 Add feature: passing metadata to the chain
+# Note: the agent is supposed to be able to generate query through muliple table, can use Chinook.db for testing
+# Update: 06/18/2025 Add Regex method to match and catch the table name in the SQL query
+
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnableLambda, RunnableWithFallbacks
 from langchain_core.messages import ToolMessage
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, BaseMessage
 
-from typing import Any
+from typing import Any, Optional, Sequence
 from typing import Annotated, Literal
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from typing_extensions import TypedDict
 
-from langgraph.graph import END, StateGraph, START
+from langgraph.graph import END, StateGraph, START, MessagesState
 from langgraph.graph.message import AnyMessage, add_messages
 from langgraph.prebuilt import ToolNode
 from IPython.display import Image, display
 from pydantic import BaseModel, Field
 from langchain_core.runnables.graph import MermaidDrawMethod
 from langchain.globals import set_verbose
+from dotenv import load_dotenv
+load_dotenv()
+from langchain_chroma import Chroma
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.callbacks.tracers.run_collector import RunCollectorCallbackHandler
+collector = RunCollectorCallbackHandler()
+import json
+import re
+import sqlglot
+from sqlUtils import *
+import requests
+from newspaper import Article
 
-##############    Pre-processing for SQL tables      ############
-# SQL database plug in:
-db = SQLDatabase.from_uri('sqlite:///Chinook.db')  # Test database
-print(db.dialect)
-print(db.get_usable_table_names())
-print(db.run('SELECT * FROM Artist LIMIT 10;'))
+def related_sql_tables(user_query):
+    model_name = "BAAI/bge-small-en"   # Embedding model for RAG semantic search
+    model_kwargs = {"device": "cpu"}
+    encode_kwargs = {"normalize_embeddings": True}
+    hf = HuggingFaceBgeEmbeddings(model_name = model_name, model_kwargs = model_kwargs, encode_kwargs = encode_kwargs)
+    # Load the vector store
+    print("Reloading the vector store...")
+    db = Chroma(collection_name = "hf_schema_all", 
+                        embedding_function=hf,
+                        persist_directory="./chroma_schema_hf_db",)
+    retriever = db.as_retriever(search_kwargs={"k": 5}, search_type = "mmr")  # Use MMR to get more diverse results
+    
+    docs = retriever.get_relevant_documents(user_query)
+    #print("Retrieved documents:", docs)
+    table_lists = []
+    for doc in docs:
+        table_lists.append(doc.metadata['table_name'])
+    
+    return table_lists, docs
 
-# Utilities getting the table name and the schema:
-toolkit = SQLDatabaseToolkit(db = db, llm = ChatOpenAI(model = "gpt-4o", max_retries = 3, temperature=0))
-tools = toolkit.get_tools()
+class SubsetSQLDatabase(SQLDatabase):
+    """A subset of SQLDatabase that only includes specified tables."""
+    
+    def get_table_names(self):
+        return self._include_tables or []
 
-list_tables_tool = next(tool for tool in tools if tool.name == 'sql_db_list_tables')
-get_schema_tool = next(tool for tool in tools if tool.name == 'sql_db_schema')
+    def get_table_info(self, table_names = None):
 
-#print(list_tables_tool.invoke(""))  # manually calling the table names
-#print(get_schema_tool.invoke('Artist')) # DDL for Artist
+        if table_names is None:
+            tables = self._include_tables
+        else:
+            tables = [t for t in table_names if t in self._include_tables]
+        return super().get_table_info(table_names=tables)
 
-##############     Utilities to handle errors     #################
-def create_tool_node_with_fallback(tools: list) -> RunnableWithFallbacks[Any, dict]:
-    return ToolNode(tools).with_fallbacks(
-        [RunnableLambda(handle_tool_error)], exception_key = 'error'
-    )
 
-def handle_tool_error(state) -> dict:
-    error = state.get('error')
-    tool_calls = state['messages'][-1].tool_calls
-    return {
-        'messages':[
-            ToolMessage(
-                content=f'Error: {repr(error)}\n please fix the problems.',
-                tool_call_id = tc['id'],
-            )
-            for tc in tool_calls
-        ]
-    }
-
-####################   Tool for the agent workflow    ##################
-@tool
-def db_query_tool(query:str) -> str:
-    """
-    Execute a SQL query against the database and get back the result.
-    If the query is not correct, an error message will be returned.
-    If an error is returned, rewrite the query, check the query, and try again.
-    """
-    result = db.run_no_throw(query)
-    print(f"This is a checking point: {tool} called with input: {query}")
-    if not result:
-        return "Error: Query failed. Please rewrite your query and try again. "
-    return result
-
-print(db_query_tool.invoke("SELECT * FROM Artist LIMIT 10;"))
-
-#################  Building Agent Workflow  ###############
-# Promt the LLM to check for common mistakes in the query and later add this as a node in the workflow
-
-query_check_system = """ You are a SQL expert with a strong attention to detail. 
-    Double check the SQLite query for common mistakes, including:
-    - Using NOT IN with NULL values
-    - Using UNION when UNION ALL should have been used
-    - Using BETWEEN for exlusive ranges
-    - Data type mismatch in predicates
-    - Properly quoting identifiers
-    - Using the correct number of arguements for functions
-    - Casting to the correct data type
-    - Using the proper columns for joins
-
-    If there are any of the above mistakes, rewrite the query. If there are no mistakes, just reproduce the orginal query.
-
-    You will call the appropriate tool to execute the query after running this check.    
-    """
-
-query_check_prompt = ChatPromptTemplate.from_messages(
-        [("system", query_check_system), ("placeholder", "{messages}")]
-    )
-
-query_check = query_check_prompt | ChatOpenAI(model = "gpt-4-turbo", max_retries = 3, temperature=0).bind_tools(
-        [db_query_tool], tool_choice = "required"
-    ) # need to check if the query is a valid SQL query
-
-# Define the state for the agent
-class State(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-
-# Define a new graoh
-workflow = StateGraph(State)
-
-# Add a node for the first tool call
-def first_tool_call(state: State) -> dict[str, list[AIMessage]]:
-    return {
-        "messages":[
-            AIMessage(
-                content = "",
-                tool_calls = [
-                    {
-                        "name": "sql_db_list_tables",
-                        "args": {},
-                        "id": "tool_abcd123",
-                    }
-                ],
-            )
-        ]
-    }
-
-def model_check_query(state: State) -> dict[str, list[AIMessage]]:
-    return {"messages": [query_check.invoke({"messages": [state["messages"][-1]]})]}
-
-workflow.add_node("first_tool_call", first_tool_call)
-
-# add nodes for the first two tools
-workflow.add_node(
-    "list_tables_tool", create_tool_node_with_fallback([list_tables_tool])
-)
-workflow.add_node("get_schema_tool", create_tool_node_with_fallback([get_schema_tool]))
-
-# add a node for a model to choose the relevant tables based on the question and available tables
-model_get_schema = ChatOpenAI(model = 'gpt-4-turbo', temperature=0).bind_tools([get_schema_tool])
-workflow.add_node(
-    "model_get_schema",
-    lambda state: {
-        "messages": [model_get_schema.invoke(state["messages"])],
-    },
-)
-
-# Describe a tool to represent the end state
-class SubmitFinalAnswer(BaseModel):
-    final_answer: str = Field(..., description = "The final answer to the user")
-
-# Add a node for a model to generate a query based on the question and schema
-query_gen_system = """You are a SQL expert with a strong attention to detail. 
-Given an input question, output a synactically correct SQLite query to run, then look at the results of the query and return the answer.
-Do NOT call any tool besides SubmitFinalAnswer to submit the final answer. Remember, the SQL query is not the final answer yet.
-When generating the query:
-Output the SQL query that answers the input question without a tool call.
-
-Unless the user specifies a specific number of examples they wish to obtain, always limit your query to at most 5 results.
-You can order the results by a relevant column to return the most interesting examples in the database.
-Never query for all the columns of a specific table, only ask for the relevant columns given the question.
-
-If you get an error while excuting a query, rewrite the query and try again.
-
-If you get an empty result set, you should try to rewrite the query to get a non-empty result set. 
-Never make stuff up if you don't have enough information to answer the query... just say you don't have enough information.
-
-If you have enough information to answer the input question, simply invoke the appropriate tool to submit the final answer to the user.
-
-Do not make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
-
-"""
-
-query_gen_prompt = ChatPromptTemplate.from_messages(
-    [("system", query_gen_system), ("placeholder", "{messages}")]
-)
-query_gen = query_gen_prompt | ChatOpenAI(model = "gpt-4-turbo", temperature=0).bind_tools(
-    [SubmitFinalAnswer]
-)
-
-def query_gen_node(state: State):
-    message = query_gen.invoke(state)
-
-    # Sometime, the LLM will hallucinate and call the wrong tool. We need to catch this and return an error message.
-    tool_messages = []
-    if message.tool_calls:
-        for tc in message.tool_calls:
-            if tc["name"] != "SubmitFinalAnswer":
-                tool_messages.append(
-                    ToolMessage(
-                        content=f"Error: The wrong tool was called: {tc['name']}. Please fix your mistakes. Remember to only call SubmitFinalAnswer to submit the final answer. Generated queries should be outputted WITHOUT a tool call. ",
-                        tool_call_id = tc["id"],
-                    )
-                )
-    else:
-        tool_messages = []
-    return {'messages': [message] + tool_messages}
-
-workflow.add_node("query_gen", query_gen_node)
-
-# add a node for the model to check the query before executing it
-workflow.add_node("correct_query", model_check_query)
-
-# add a node for executing the query
-workflow.add_node("execute_query", create_tool_node_with_fallback([db_query_tool]))
-
-# Define a conditional edge to decide whether to continue or end the workflow
-def should_continue(state: State) -> Literal[END, "correct_query", "query_gen"]:
-    messages = state["messages"]
-    last_message = messages[-1]
-    # If there is a tool call, then we finish
-    if getattr(last_message, "tool_calls", None):
-        return END
-    if last_message.content.startswith("Error:"):
-        return "query_gen"
-    else:
-        return "correct_query"
-
-# Specify the edges between the node:
-workflow.add_edge(START, "first_tool_call")
-workflow.add_edge("first_tool_call", "list_tables_tool")
-workflow.add_edge("list_tables_tool", "model_get_schema")
-workflow.add_edge("model_get_schema", "get_schema_tool")
-workflow.add_edge("get_schema_tool", "query_gen")
-workflow.add_conditional_edges("query_gen", should_continue,)
-workflow.add_edge("correct_query", "execute_query")
-workflow.add_edge("execute_query", "query_gen")
-
-# complie the workflow into a runnable
-app = workflow.compile()
 
 # Draw the workflow
 
@@ -240,193 +90,227 @@ def draw_agent_worflow():
         )
     print('Save graph to workflow.png')
 
-#################  Now is the time to evaluate the agent to the reference answer   ###############
-import json
+def promptDicts():
+    # need to load queries from json file
 
-def predict_sql_agent_answer(example: dict):
-    '''use this for answer evaluation'''
-    msg = {"messages": ("user", example["input"])}
-    #msg = {"messages": ("user", example)}
-    messages = app.invoke(msg)
-    json_str = messages["messages"][-1].tool_calls[0]["args"]
-    response = json_str["final_answer"]
-    return {"response": response}
+    with open('PromptLibs.json', 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data
 
-from langchain import hub
-from langchain_openai import ChatOpenAI
+##################  Building Agent Workflow  ###############
+    # Promt the LLM to check for common mistakes in the query and later add this as a node in the workflow
 
-# Grade prompt:
-grade_prompt_answer_accuracy = prompt = hub.pull("langchain-ai/rag-answer-vs-reference")
-
-def answer_evaluator(run, example) -> dict:
-    '''
-    A simple evaluator for RAG answer accuracy
-    '''
-    print('See what is inside the run param', run.outputs)
-    # Get question, ground truth answer, chain
-    input_question = example.inputs["input"]
-    reference = example.outputs["output"]
-    prediction = run.outputs["response"]
-
-    # LLM grader
-    llm = ChatOpenAI(model = "gpt-4o", temperature = 0)
-
-    # Structured Prompt
-    answer_grader = grade_prompt_answer_accuracy | llm
-
-    # RUN evaluator
-    score = answer_grader.invoke(
-        {
-            "question": input_question,
-            "correct_answer": reference,
-            "student_answer": prediction,
-        }
-    )
-    score = score["Score"]
-    return {'key': 'answer_v_reference_score', "score": score}
-
-# Trajectory:
-
-def predict_sql_agent_messages(example: dict):
-    """ Use this for answer evaluation """
-    msg = {"messages": ("user", example["input"])}
-    messages = app.invoke(msg)
-    return {"response": messages}
-
-from langsmith.schemas import Example, Run
-def find_tool_calls(messages):
-    '''
-    Find all tool calls in the messages returned
-    '''
-    tool_calls = [
-        tc["name"] for m in messages["messages"] for tc in getattr(m, "tool_calls", [])
-    ]
-    return tool_calls
-
-def contains_all_tool_calls_in_order_exact_match(
-    root_run: Run, example: Example
-) -> dict:
-    """
-    Check if all expected tools are called in exact order and without any additional tool calls
-    """
-    expected_trajectory = [
-        "sql_db_list_tables", 
-        "sql_db_schema",
-        "db_query_tool",
-        "SubmitFinalAnswer",
-    ]
-    messages = root_run.outputs["response"]
-    tool_calls = find_tool_calls(message)
-
-    # Print out the tool calls for debugging
-    print("Here are my tool calls")
-    print(tool_calls)
-
-    # Check if the tool calls match the expected trajectory exactly
-    if tool_calls == expected_trajectory:
-        score = 1
-    else:
-        score = 0
+class State(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    retry_count: Optional[int] = Field(default=0, description="Number of retries for the last query attempt")
     
-    return {"score": int(score), "key": "multi_tool_call_in_exact_order"}
 
-def contains_all_tool_calls_in_order(root_run: Run, example: Example) -> dict:
-    """
-    Check if all expected tools are called in order,
-    but it allows for other tools to be called in bewtween the expected ones.
-    """
-    messages = root_run.outputs["response"]
-    tool_calls = find_tool_calls(messages)
+def sql_chain(user_query, comLLM):
+    promptLibs = promptDicts()
+    table_lists, docs = related_sql_tables(user_query)
+    print("Related SQL tables:", table_lists)
+    db = SubsetSQLDatabase.from_uri('mysql+mysqlconnector://web:JAzv3WHQh-y@newsdayinteractive.cr2zrybivkdw.us-east-1.rds.amazonaws.com:3306/daily',
+        include_tables = table_lists)
+        #sample_rows_in_table_info = 3)  # Test database
+    #db = SQLDatabase.from_uri("sqlite:///Chinook.db")
+    # For testing
+    print("Available tables in the database:", db.get_usable_table_names())
+    llm = ChatOpenAI(model = comLLM, max_retries = 3, temperature=0)
+    toolkit = SQLDatabaseToolkit(db = db, llm = llm)
+    tools = toolkit.get_tools()
 
-    print("Here are my tool calls: ")
-    print(tool_calls)
+    get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
+    get_schema_node = ToolNode([get_schema_tool], name = "get_schema")
 
-    it = iter(tool_calls)
-    if all(elem in it for elem in expected_trajectory):
-        score = 1
-    else:
-        score = 0
-    return {"score": int(score), "key": "multi_tool_call_in_order"}
+    run_query_tool = next(tool for tool in tools if tool.name == "sql_db_query")
+    run_query_node = ToolNode([run_query_tool], name = "run_query")
 
+    def list_tables(state: State):
+        tool_call = {
+            "name": "sql_db_list_tables",
+            "args": {},
+            "id": "abc123",
+            "type": "tool_call",
+        }
+        tool_call_message = AIMessage(content = "", tool_calls = [tool_call])
+
+        list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
+        tool_message = list_tables_tool.invoke(tool_call)
+        response = AIMessage(f"Available tables: {tool_message.content}")
+
+        return {"messages": [tool_call_message, tool_message, response]}
+
+    def call_get_schema(state: State):
+        llm_with_tools = llm.bind_tools([get_schema_tool], tool_choice = "any")
+        response = llm_with_tools.invoke(state['messages'])
+
+        return {"messages": [response]}
+
+    generate_query_system_prompt = promptLibs['sql_query_gen_system'].format(dialect = db.dialect, top_k = 5)
+
+    def generate_query(state: State):
+        system_message = {
+            "role": "system",
+            "content": generate_query_system_prompt,
+        }
+        llm_with_tools = llm.bind_tools([run_query_tool])
+        response = llm_with_tools.invoke([system_message] + state['messages'])
+        return {"messages": [response]}
+
+    check_query_system_prompt = promptLibs['sql_query_check_system'].format(dialect = db.dialect)
+
+    def check_query(state: State):
+        system_message = {
+            "role": "system",
+            "content": check_query_system_prompt,
+        }
+        # generate artificial user message to check
+        tool_call = state["messages"][-1].tool_calls[0]
+        user_message = {"role": "user", "content": tool_call['args']['query']}
+        llm_with_tools = llm.bind_tools([run_query_tool], tool_choice = "any")
+        response = llm_with_tools.invoke([system_message, user_message])
+        response.id = state["messages"][-1].id
+        return {"messages": [response]}
+
+    def should_continue(state: State) -> Literal[END, "check_query"]:
+        message = state["messages"]
+        last_message = message[-1]
+        if not last_message.tool_calls:
+            return END
+        else:
+            return "check_query"
+    
+    builder = StateGraph(MessagesState)
+    builder.add_node(list_tables)
+    builder.add_node(call_get_schema)
+    builder.add_node(get_schema_node, "get_schema")
+    builder.add_node(generate_query)
+    builder.add_node(check_query)
+    builder.add_node(run_query_node, "run_query")
+
+    builder.add_edge(START, "list_tables")
+    builder.add_edge("list_tables", "call_get_schema")
+    builder.add_edge("call_get_schema", "get_schema")
+    builder.add_edge("get_schema", "generate_query")
+    builder.add_conditional_edges(
+        "generate_query",
+        should_continue,
+    )
+    builder.add_edge("check_query", "run_query")
+    builder.add_edge("run_query", "generate_query")
+
+    app = builder.compile()
+
+    return app, docs
 
 def main():
+    print("Routing to SQL Agent...")
+    #user_query = "Which people have the same last name in the Village of Hempstead payroll?"  # Example user query
+    #user_query = "Could you pull out 10 people in the village of hempstead payroll and give me the sum of their salaries?"
+    #user_query = "Retrieve number of incidents and their severity levels (minor, moderate, severe) for motor vehicle crashes in 2023 from the structured investment data database."
+    user_query = "Retrieve tuition fees and other costs for current New York College students from the investigation data database?"
+    #user_query = "Which sales agent made the most in sales in 2009?"  # for test database: Chinook.db
+    comLLM = "gpt-4o"  # Commercial LLM for accurate and reliable responses
+    sql_app, docs = sql_chain(user_query, comLLM)
     
-    # Run the Agent
-    messages = app.invoke(
-        {"messages": [("user", "Which country's customers spent the most? And how much did they spend?")]}
-    )
-
-    json_str = messages["messages"][-1].tool_calls[0]["args"]["final_answer"]
-    print('######## Here is the output of agent  ########## ')
-    print('Checking the final answer: ', json_str)
-
-    for event in app.stream(
-        {"messages": [("user", "Which country's customers spent the most? And how much did they spend?")]}
+    try:
+        response = sql_app.invoke({"messages": [("user", user_query)]}, {"recursion_limit": 25})
+        print("SQL Agent Response:", response["messages"][-1].content)
+    except Exception as e:
+        print("An error occurred:", e)
+    
+    '''
+    for step in sql_app.stream(
+        {"messages": [{"role":"user", "content":user_query}]},
+        stream_mode = "values",
     ):
-        print(event)
-
+        step["messages"][-1].pretty_print()
+        print('Note:', step["messages"][-1])
     '''
 
-    ############  Create a Evaluation Dataset   ##############
-    from langsmith import Client
-    client = Client()
-    # Create a dataset
-    examples = [
-        #("Which country's customers spent the most? And how much did they spend?", "The country whose customers spent the most is the USA, with a total expenditure of $523.06"),
-        #("What was the most purchased track of 2013?", "The most purchased track of 2013 was Hot Girl."),
-        #("How many albums does the artist Led Zeppelin have?", "Led Zeppelin has 14 albums."),
-        #("What is the total price for the album 'Big Ones'?", "The total price for the album 'Big Ones' is 14.85"),
-        ("Which sales agent made the most in sales in 2009?", "Steve Johnson made the most most sales in 2009"),
-    ]
-    dataset_name = "SQL Agent Response"
-    if not client.has_dataset(dataset_name = dataset_name):
-        dataset = client.create_dataset(dataset_name = dataset_name)
-        inputs, outputs = zip(
-            *[({"input": text}, {"output": label}) for text, label in examples]
-        )
-        client.create_examples(inputs=inputs, outputs=outputs, dataset_id = dataset.id)
 
-    from langsmith.evaluation import evaluate
+    #''' Just some notes, but the info should be in the intermediate steps
+    print("########################################### SQL Agent Response ###########################################")
+    #print(response["messages"])
+    #print("first item:", response["messages"][-4])   # Schema of the database
+    #print("second item:", response["messages"][-3])  # Generated SQL query
+    #print("third item:", response["messages"][-2])   # Answer as in table structure
+    #print("fourth item:", response["messages"][-1])  # Final answer after formatted
+    #'''
+    #tool_name = response["messages"][-3].tool_calls[0]['name']  # To confirm tool calling
+    #SqlQuery = response["messages"][-3].tool_calls[0]['args']['query']  # Extract the SQL query
+    #print(tool_name)
+    #print("Generated SQL Query:", SqlQuery)
+    tool_name = response["messages"][-3].tool_calls[0]["name"]
+    print("Tool Name:", tool_name)
 
-    #print('Input user prompt: ', examples[0][0])
-    #print(predict_sql_agent_answer(examples[0][0]))
-    
-    dataset_name = "SQL Agent Response"
-    try:
-        experiment_results = evaluate(
-            predict_sql_agent_answer,
-            data = dataset_name,
-            evaluators = [answer_evaluator],
-            num_repetitions = 3,
-            experiment_prefix = "sql-agent-multi-step-response-v-reference",
-            metadata = {'version': "Chinook, gpt-4o multi-step-agent"},
-        )
-    except:
-        print('Pleaset set up LangSmitch')
-    
-    ########### Evaluate Trajectory #################
-    # These are the tools that we expect the agent to use
-    expected_trajectory = [
-        "sql_db_list_tables",       # first: list_tables_tool node
-        "sql_db_schema",            # second: get_schema_tool node
-        "db_query_tool",            # third: execute_query node
-        "SubmitFinalAnswer",         # fourth: query_gen
-    ]
+    if tool_name == "sql_db_query":
+        sql_query = response["messages"][-3].tool_calls[0]["args"]["query"]
+        print("SQL Query:", sql_query)
+        table_names, formatted_query = get_table_names_from_sql(sql_query)
 
-    try: experiment_results = evaluate(
-        predict_sql_agent_messages,
-        data = dataset_name,
-        evaluators = [
-            contains_all_tool_calls_in_order,
-            contains_all_tool_calls_in_order_exact_match,
-        ],
-        num_repetitions=3,
-        experiment_prefix="sql-agent-multi-step-tool-calling-trajectory-in-order",
-        metadata={"version": "Chinook, gpt-4o multi-step-agent"},
-    )
-    except:
-        print("Please setup LangSmith")
+        print("Table names in the SQL query:", table_names)
+        print("Formatted SQL Query:", formatted_query)
+        # Need to fetch the table schema from the database
+        # Deal with one table first
+        #table_name = table_names[0]
+        #table_info = get_table_schema(table_name)
+        #print(f"Schema for table '{table_name}':", table_info)
+        updated_docs = []
+        for doc in docs:
+            if doc.metadata['table_name'] in table_names:
+                updated_docs.append(doc)
     
-'''
+
+def sqlPost():
+    # This is a post-processing step to extract table names from the SQL query
+    SqlQuery = """SELECT e.FirstName, e.LastName, SUM(i.Total) as TotalSales
+                FROM Employee e
+                JOIN Customer c ON e.EmployeeId = c.SupportRepId
+                JOIN Invoice i ON c.CustomerId = i.CustomerId
+                WHERE strftime('%Y', i.InvoiceDate) = '2009'
+                GROUP BY e.EmployeeId
+                ORDER BY TotalSales DESC
+                LIMIT 1;"""
+
+    # To match and catch the table name -- Using Regex Method
+    tree = sqlglot.parse_one(SqlQuery)
+    table_names = [table.name for table in tree.find_all(sqlglot.expressions.Table)]
+    print("Table names in the SQL query:", table_names)
+    formatted_query = tree.sql(pretty=True)
+    print("Formatted SQL Query:", formatted_query)
+
+def test_schema():
+    table_names = ['061418_college_costs']
+    table_name = table_names[0]
+    table_info = get_table_schema(table_name)
+    print(f"Schema for table '{table_name}':", table_info)
+
+def test_schema2():
+    user_query = "Retrieve tuition fees and other costs for current New York College students from the investigation data database?"
+    table_lists, docs = related_sql_tables(user_query)
+    print(table_lists, len(docs))
+    # Now we have the docs
+    # For example if we get a list of table names from sql query:
+    # What we want to do is:
+    table_names = ['061418_college_costs'] # This should be a table that being updated with the inventory
+    updated_docs = []
+    for doc in docs:
+        if doc.metadata['table_name'] in table_names:
+            updated_docs.append(doc)
+    #print("Updated documents:", len(updated_docs), updated_docs[0].metadata['table_name'])
+    #print("Other metadata:", updated_docs[0].metadata)
+    #print("Url + Last updated date:", updated_docs[0].metadata['url'], updated_docs[0].metadata['last_updated'])
+
+    # Now we want to open the url and extract the article content
+    #print(updated_docs[0].metadata)
+    #print("Url:", updated_docs[0].metadata['url'])
+    #print("Last updated date:", updated_docs[0].metadata['last_updated'])
+    #print("associated articles:", updated_docs[0].metadata['associate_article'])
+    print("Page content:", updated_docs[0].page_content)
+    #print("Whole doc: ", updated_docs[0])
+
+
 if __name__ == '__main__':
     main()
+    #test_schema2()
